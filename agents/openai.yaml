@@ -1,0 +1,4 @@
+display_name: LED Projects Poster Maker
+short_description: Create 4K English promo posters from LED installation case photos.
+default_prompt: Make portrait and landscape LED project case posters from the photos in this folder, with English labels, model numbers, project sizes, and quotation CTA copy.
+

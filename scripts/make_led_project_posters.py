@@ -4,17 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 
 ACCENT = (0, 206, 201, 255)
 BG_TOP = (7, 13, 24)
 BG_BOTTOM = (18, 40, 55)
+SPEC_ROWS = [("P1.25 – P1.86", "Fine-pitch indoor LED"), ("P2.5 – P3.91", "Commercial indoor LED"), ("P4 – P10", "Outdoor LED displays")]
 
 
 @dataclass
@@ -25,6 +28,8 @@ class CaseImage:
     title: str
     size: str
     focus: tuple[float, float] = (0.5, 0.5)
+    crop: tuple[float, float, float, float] | None = None  # fractional (left, top, right, bottom) pre-crop
+    fit: str = "cover"  # "contain" keeps the whole (cropped) photo visible over a blurred fill
 
 
 def font(name: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -82,6 +87,20 @@ def detect_cases(folder: Path) -> dict[str, CaseImage]:
     return cases
 
 
+def load_manifest(folder: Path, manifest: Path) -> list[CaseImage]:
+    """Ordered case list from cases.json; the first entry is the hero image."""
+    items = json.loads(manifest.read_text(encoding="utf-8"))
+    cases = []
+    for i, it in enumerate(items):
+        path = folder / it["file"]
+        if not path.exists():
+            raise SystemExit(f"Manifest file not found: {path}")
+        cases.append(CaseImage(f"case{i}", path, it["model"], it["title"], it["size"], tuple(it.get("focus", (0.5, 0.5))), tuple(it["crop"]) if "crop" in it else None, it.get("fit", "cover")))
+    if len(cases) < 2:
+        raise SystemExit("Manifest needs at least a hero and one case")
+    return cases
+
+
 def gradient(size: tuple[int, int], top=BG_TOP, bottom=BG_BOTTOM) -> Image.Image:
     w, h = size
     out = Image.new("RGBA", size)
@@ -93,8 +112,25 @@ def gradient(size: tuple[int, int], top=BG_TOP, bottom=BG_BOTTOM) -> Image.Image
     return out
 
 
-def cover(path: Path, size: tuple[int, int], focus=(0.5, 0.5)) -> Image.Image:
-    im = Image.open(path).convert("RGB")
+def cover(path: Path, size: tuple[int, int], focus=(0.5, 0.5), crop=None, fit="cover", reserve_bottom=0) -> Image.Image:
+    im = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    if crop:
+        iw, ih = im.size
+        im = im.crop((int(crop[0] * iw), int(crop[1] * ih), int(crop[2] * iw), int(crop[3] * ih)))
+    iw, ih = im.size
+    w, h = size
+    if fit == "contain":
+        bg = cover_resize(im, size, focus).filter(ImageFilter.GaussianBlur(40))
+        bg = Image.eval(bg, lambda v: int(v * 0.45))
+        ah = h - reserve_bottom  # keep the photo clear of the label overlay
+        scale = min(w / iw, ah / ih)
+        fg = im.resize((int(iw * scale), int(ih * scale)), Image.Resampling.LANCZOS)
+        bg.paste(fg, ((w - fg.width) // 2, (ah - fg.height) // 2))
+        return bg
+    return cover_resize(im, size, focus)
+
+
+def cover_resize(im: Image.Image, size: tuple[int, int], focus=(0.5, 0.5)) -> Image.Image:
     iw, ih = im.size
     w, h = size
     scale = max(w / iw, h / ih)
@@ -139,10 +175,10 @@ def pill(draw: ImageDraw.ImageDraw, x: int, y: int, text: str, size=42) -> None:
     draw.text((x + 28, y + 14), text, font=f, fill=(5, 22, 32, 255))
 
 
-def tile_label(base: Image.Image, box: tuple[int, int, int, int], case: CaseImage, scale=1.0) -> None:
+def tile_label(base: Image.Image, box: tuple[int, int, int, int], case: CaseImage, scale=1.0, pad: int | None = None) -> None:
     x, y, w, h = box
     d = ImageDraw.Draw(base)
-    pad = int(28 * scale)
+    pad = int(28 * scale) if pad is None else pad
     overlay_h = int(170 * scale)
     grad = Image.new("RGBA", (w, overlay_h), (0, 0, 0, 0))
     gd = ImageDraw.Draw(grad)
@@ -175,12 +211,44 @@ def cta_two_line(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], line
     draw.text((x + int(48 * scale), y + int(78 * scale)), line2, font=f2, fill=(5, 22, 32, 245))
 
 
-def make_portrait(cases: dict[str, CaseImage], out: Path) -> None:
-    pw, ph = 2160, 3400
+def place_rows(base: Image.Image, tiles: list[CaseImage], x0: int, y0: int, total_w: int, rows: list[tuple[int, int]], gap=40) -> int:
+    """Lay tiles into rows of (count, height); returns the y after the last row."""
+    i, y = 0, y0
+    for count, h in rows:
+        if i >= len(tiles):
+            break
+        w = (total_w - gap * (count - 1)) // count
+        scale = min(1.0, w / 620)
+        for c in range(count):
+            if i >= len(tiles):
+                break
+            box = (x0 + c * (w + gap), y, w, h)
+            rounded_paste(base, cover(tiles[i].path, (w, h), tiles[i].focus, tiles[i].crop, tiles[i].fit, int(110 * scale)), box, 34, True)
+            tile_label(base, box, tiles[i], scale)
+            i += 1
+        y += h + 65
+    return y
+
+
+def save_jpg(im: Image.Image, out: Path) -> None:
+    """Write to a temp file then swap in, so an open image viewer never sees a half-written JPG."""
+    tmp = out.with_suffix(".tmp.jpg")
+    im = im.convert("RGB")
+    im.save(tmp, "JPEG", quality=96, subsampling=0)
+    os.replace(tmp, out)
+    # Lightweight copy (~0.7 MB vs ~3 MB) for WhatsApp / email; 75% keeps the smallest text crisp.
+    web = out.with_name(out.name.replace("-4k.jpg", "-web.jpg"))
+    small = im.resize((round(im.width * 0.75), round(im.height * 0.75)), Image.LANCZOS)
+    small.save(tmp, "JPEG", quality=85, optimize=True, progressive=True)
+    os.replace(tmp, web)
+
+
+def make_portrait(cases: list[CaseImage], out: Path, subtitle: str, pill_text: str, title: str) -> None:
+    pw, ph = 2160, 4200  # cropped to content height at the end
     poster = gradient((pw, ph))
     d = ImageDraw.Draw(poster)
 
-    hero = cover(cases["hero"].path, (pw, 1040), cases["hero"].focus).convert("RGBA")
+    hero = cover(cases[0].path, (pw, 1040), cases[0].focus, cases[0].crop).convert("RGBA")
     ov = Image.new("RGBA", (pw, 1040), (0, 0, 0, 0))
     od = ImageDraw.Draw(ov)
     for yy in range(1040):
@@ -189,97 +257,89 @@ def make_portrait(cases: dict[str, CaseImage], out: Path) -> None:
         od.line((xx, 0, xx, 1040), fill=(0, 0, 0, int(150 * (1 - xx / pw))))
     hero.alpha_composite(ov)
     poster.alpha_composite(hero, (0, 0))
+    tile_label(poster, (0, 0, pw, 1040), cases[0], 1.25, pad=116)
 
-    pill(d, 116, 96, "RECENT KOREA PROJECTS")
-    d.multiline_text((116, 228), "LED Display\nInstallations", font=font("arialbd.ttf", 132), fill=(255, 255, 255, 255), spacing=0)
-    d.text((122, 558), "Indoor & outdoor LED screen references recently delivered in Korea", font=font("arial.ttf", 50), fill=(226, 238, 245, 245))
+    pill(d, 116, 96, pill_text)
+    d.multiline_text((116, 228), title, font=font("arialbd.ttf", 132), fill=(255, 255, 255, 255), spacing=0)
+    d.text((122, 558), subtitle, font=fit_text(d, subtitle, 1928, 50, False), fill=(226, 238, 245, 245))
 
     d.rounded_rectangle((116, 1115, 2044, 1290), radius=36, fill=(255, 255, 255, 240))
-    for i, (a, b) in enumerate([("P1.86", "Modern House Indoor"), ("P2.5", "Commercial Indoor"), ("P3.91 / P10", "Outdoor LED")]):
+    for i, (a, b) in enumerate(SPEC_ROWS):
         x = 178 + i * 610
         d.text((x, 1150), a, font=font("arialbd.ttf", 58), fill=(6, 23, 35, 255))
         d.text((x, 1218), b, font=font("arial.ttf", 39), fill=(68, 84, 98, 255))
         if i < 2:
             d.line((x + 520, 1150, x + 520, 1254), fill=(180, 195, 207), width=4)
 
-    placements = [
-        ("p10", (116, 1370, 928, 475)),
-        ("p25_install", (1116, 1370, 928, 475)),
-        ("p186_modern", (116, 1910, 928, 420)),
-        ("p25_8000", (1116, 1910, 928, 420)),
-        ("p186_column", (116, 2395, 590, 400)),
-        ("p391", (785, 2395, 590, 400)),
-        ("p186_front", (1454, 2395, 590, 400)),
-    ]
-    for key, box in placements:
-        case = cases[key]
-        rounded_paste(poster, cover(case.path, (box[2], box[3]), case.focus), box, 34, True)
-        tile_label(poster, box, case)
-
+    y = place_rows(poster, cases[1:], 116, 1370, 1928, [(2, 520), (3, 400), (3, 400), (4, 340)])
     cta_two_line(
         d,
-        (116, 3025, 1928, 160),
+        (116, y + 15, 1928, 160),
         "Planning an LED display project?",
         "Send your size, location and installation needs for a fast quotation.",
     )
     support = "Fine-pitch indoor LED walls, creative columns and outdoor billboard displays for commercial projects."
-    d.text((116, 3260), support, font=fit_text(d, support, 1928, 38, False), fill=(208, 226, 236, 235))
-    poster.convert("RGB").save(out, quality=96, subsampling=0)
+    d.text((116, y + 250), support, font=fit_text(d, support, 1928, 38, False), fill=(208, 226, 236, 235))
+    poster = poster.crop((0, 0, pw, y + 380))
+    save_jpg(poster, out)
 
 
-def make_landscape(cases: dict[str, CaseImage], out: Path) -> None:
+def make_landscape(cases: list[CaseImage], out: Path, subtitle: str, pill_text: str, title: str) -> None:
     lw, lh = 3840, 2160
     land = gradient((lw, lh), (6, 12, 22), (16, 38, 54))
     d = ImageDraw.Draw(land)
 
-    pill(d, 150, 120, "KOREA LED DISPLAY CASES", 40)
-    d.multiline_text((150, 270), "Recent LED\nDisplay Projects", font=font("arialbd.ttf", 150), fill=(255, 255, 255, 255), spacing=0)
-    d.multiline_text((156, 640), "Real indoor and outdoor installations\nrecently delivered in Korea.", font=font("arial.ttf", 54), fill=(226, 238, 245, 245), spacing=18)
+    pill(d, 150, 120, pill_text, 40)
+    d.multiline_text((150, 270), title, font=font("arialbd.ttf", 150), fill=(255, 255, 255, 255), spacing=0)
+    d.multiline_text((156, 640), subtitle, font=font("arial.ttf", 54), fill=(226, 238, 245, 245), spacing=18)
 
-    for i, (a, b) in enumerate([("P1.86", "Modern house LED walls"), ("P2.5", "Commercial indoor LED screens"), ("P3.91 / P10", "Outdoor billboard displays")]):
+    for i, (a, b) in enumerate(SPEC_ROWS):
         y = 900 + i * 135
         d.rounded_rectangle((150, y, 1160, y + 102), radius=28, fill=(22, 45, 62, 255), outline=(75, 110, 128, 255), width=3)
-        d.text((205, y + 23), a, font=font("arialbd.ttf", 52), fill=(255, 255, 255, 255))
-        d.text((530, y + 34), b, font=font("arial.ttf", 38), fill=(202, 220, 230, 255))
+        af = font("arialbd.ttf", 52)
+        d.text((205, y + 23), a, font=af, fill=(255, 255, 255, 255))
+        ax = 205 + d.textbbox((0, 0), a, font=af)[2] + 40
+        d.text((ax, y + 34), b, font=fit_text(d, b, 1160 - 40 - ax, 38, False), fill=(202, 220, 230, 255))
 
     cta_two_line(d, (150, 1345, 1130, 210), "Need a quotation?", "Share project size and location with us.", 1.35)
-    rounded_paste(land, cover(cases["hero"].path, (2280, 900), cases["hero"].focus), (1390, 115, 2280, 900), 50, True)
-    tile_label(land, (1390, 115, 2280, 900), cases["hero"], 1.15)
+    hero_h = 900 if len(cases) <= 7 else 700
+    rounded_paste(land, cover(cases[0].path, (2280, hero_h), cases[0].focus, cases[0].crop), (1390, 115, 2280, hero_h), 50, True)
+    tile_label(land, (1390, 115, 2280, hero_h), cases[0], 1.15)
 
-    placements = [
-        ("p10", (1390, 1090, 700, 315)),
-        ("p25_install", (2180, 1090, 700, 315)),
-        ("p25_8000", (2970, 1090, 700, 315)),
-        ("p186_modern", (1390, 1480, 700, 315)),
-        ("p186_column", (2180, 1480, 700, 315)),
-        ("p391", (2970, 1480, 700, 315)),
-    ]
-    for key, box in placements:
-        case = cases[key]
-        rounded_paste(land, cover(case.path, (box[2], box[3]), case.focus), box, 34, True)
-        tile_label(land, box, case, 0.9)
-
+    rows = [(3, 315), (3, 315)] if len(cases) <= 7 else [(4, 330), (4, 330), (4, 330)]
+    y = place_rows(land, cases[1:], 1390, 115 + hero_h + 75, 2280, rows)
     note = "For new LED display projects, send drawings or target screen size to get a fast quotation."
-    d.text((1390, 1888), note, font=fit_text(d, note, 2280, 44, False), fill=(211, 229, 238, 235))
-    land.convert("RGB").save(out, quality=96, subsampling=0)
+    d.text((1390, y - 5), note, font=fit_text(d, note, 2280, 44, False), fill=(211, 229, 238, 235))
+    save_jpg(land, out)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", "-i", type=Path, default=Path.cwd(), help="Folder containing LED project images")
     parser.add_argument("--output", "-o", type=Path, default=None, help="Output folder, defaults to input folder")
-    parser.add_argument("--prefix", default="korea-led-projects", help="Output filename prefix")
+    parser.add_argument("--prefix", default="led-projects", help="Output filename prefix")
+    parser.add_argument("--manifest", "-m", type=Path, default=None, help="cases.json (defaults to <input>/cases.json if present)")
+    parser.add_argument("--pill", default="RECENT LED PROJECTS", help="Small tag text above the title")
+    parser.add_argument("--title", default="LED Display\\nInstallations", help="Big headline; use \\n for a line break")
+    parser.add_argument("--subtitle", default="Indoor & outdoor LED screen references recently delivered", help="Subtitle under the title")
     args = parser.parse_args()
 
     input_dir = args.input.resolve()
     output_dir = (args.output or input_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cases = detect_cases(input_dir)
+    manifest = args.manifest or (input_dir / "cases.json")
+    if manifest.exists():
+        cases = load_manifest(input_dir, manifest)
+    else:
+        legacy = detect_cases(input_dir)
+        cases = [legacy["hero"]] + [c for k, c in legacy.items() if k != "hero"]
     portrait = output_dir / f"{args.prefix}-poster-4k.jpg"
     landscape = output_dir / f"{args.prefix}-banner-4k.jpg"
-    make_portrait(cases, portrait)
-    make_landscape(cases, landscape)
+    subtitle = args.subtitle
+    title = args.title.replace("\\n", "\n")
+    make_portrait(cases, portrait, subtitle, args.pill, title)
+    make_landscape(cases, landscape, subtitle.replace(" recently", "\nrecently"), args.pill, title)
     print(portrait)
     print(landscape)
 

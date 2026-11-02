@@ -20,10 +20,18 @@ Use real project photos. Do not use image generation to redraw installation scen
 
 ## Default Output
 
-Generate both files unless the user asks otherwise:
+Always generate two variants (four files) unless the user asks otherwise. Allen sends the Korea version to Korean customers and the neutral version to every other country:
 
-- `korea-led-projects-poster-4k.jpg`: tight portrait, default `2160x3400`.
-- `korea-led-projects-banner-4k.jpg`: landscape 4K, default `3840x2160`.
+- `korea-projects-*`: title `RECENT KOREA\nPROJECTS`, subtitle ends with `in Korea`.
+- `recent-projects-*`: title `RECENT\nPROJECTS`, subtitle without any country.
+
+Each variant has:
+
+- `<prefix>-poster-4k.jpg`: portrait `2160` wide, height cropped to content (about `3400-3700`).
+- `<prefix>-banner-4k.jpg`: landscape 4K, default `3840x2160`.
+- `<prefix>-poster-web.jpg` / `<prefix>-banner-web.jpg`: lightweight copies (75% size, JPEG q85, about 0.7 MB vs 3 MB) for WhatsApp and email. The 4K files stay full quality.
+
+Both variants use the same `cases.json`, the same pill `LED DISPLAY INSTALLATIONS` and the same layout; only title and subtitle differ.
 
 Keep the output in the user's current project/photo folder. Avoid overwriting source photos.
 
@@ -39,18 +47,27 @@ Keep the output in the user's current project/photo folder. Avoid overwriting so
    - Always show the model/pixel pitch on each case card.
    - Include screen size where available from the filename.
 
-3. Choose layout.
-   - Portrait: hero image at top, spec strip, 2 large cards, 2 medium cards, 3 small cards, CTA near the bottom.
-   - Landscape: left-side headline/spec/CTA, right-side hero image, 2 rows of case cards, footer line above the bottom edge.
+3. Write `cases.json` in the photo folder (one entry per case, first entry = hero).
+   - Fields: `file`, `model`, `title`, `size`, optional `focus` `[x, y]` crop anchor (0-1), optional `crop` `[left, top, right, bottom]` fractional pre-crop for tall phone photos where the screen is a small part of the frame, optional `fit: "contain"` to show the whole (cropped) photo over a blurred fill when the screen would otherwise be cut off.
+   - If a case only has video, grab a frame: `ffmpeg -ss 8 -i video.mp4 -frames:v 1 -q:v 2 "<case> (video frame).jpg"`, then list that file.
+   - Pick one best photo per project; up to 12 cases after the hero. Prefer photos showing content on the screen over bare structure.
+   - Example entry: `{"file": "P1.86 indoor 6400x1120 (1).jpeg", "model": "P1.86", "title": "Restaurant Menu LED Wall", "size": "6400 x 1120 mm"}`
+
+4. Layout (handled by the script from the case count).
+   - Portrait: hero image at top, spec strip, rows of 2 / 3 / 3 / 4 cards, CTA near the bottom, canvas cropped to content.
+   - Landscape: left-side headline/spec/CTA, right-side hero image, 2 rows of 3 (<= 7 cases) or 3 rows of 4 (<= 13 cases), footer line above the bottom edge.
    - Avoid excessive empty bottom space; crop portrait height tighter if needed.
    - Keep all text fully inside cards. Do not let CTA blocks overlap or hide card text.
 
-4. Generate deterministic composites.
+5. Generate deterministic composites.
    - Prefer the bundled script: `python scripts/make_led_project_posters.py --input <photo-folder>`.
+   - It reads `<photo-folder>/cases.json` when present; without it, it falls back to the legacy Korean filename patterns.
+   - `--title`, `--pill` and `--subtitle` override the headline (`
+` = line break), tag and subtitle copy (e.g. add "in Korea" for a Korean-market version).
    - The script uses Pillow and preserves the source images as real photos.
    - If Pillow is missing, install or ask the user before using another implementation path.
 
-5. Validate visually.
+6. Validate visually.
    - Open both outputs with the image viewer.
    - Check that every case has a model label.
    - Check that labels are not cut off at the bottom.
@@ -122,12 +139,15 @@ If a filename includes dimensions, convert them into readable text:
 
 ## Script Notes
 
-The bundled script is designed for folders similar to Korean LED project case photo collections. It uses filename pattern matching first, then falls back to available JPG/PNG images.
+The bundled script renders from `cases.json` (preferred). Without a manifest it uses the legacy Korean filename pattern matching, then falls back to available JPG/PNG images.
 
-Typical command:
+Run both commands every time (Korea + neutral):
 
 ```powershell
-python scripts\make_led_project_posters.py --input "C:\Users\Administrator\Desktop\韩国案例"
+# Korea version
+python scripts\make_led_project_posters.py --input "<photo-folder>" --output "<photo-folder>\out" --prefix korea-projects --title "RECENT KOREA\nPROJECTS" --pill "LED DISPLAY INSTALLATIONS" --subtitle "Indoor & outdoor LED screen references recently delivered in Korea"
+# Neutral version for other countries
+python scripts\make_led_project_posters.py --input "<photo-folder>" --output "<photo-folder>\out" --prefix recent-projects --title "RECENT\nPROJECTS" --pill "LED DISPLAY INSTALLATIONS" --subtitle "Indoor & outdoor LED screen references recently delivered"
 ```
 
 Optional output directory:
